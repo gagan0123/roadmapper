@@ -117,5 +117,4 @@ test_chatbot_firebase/roadmapper-e7f85-firebase-adminsdk-fbsvc-fca400b730.json #
 # Output files from your specific application, if any
 # output/
 # results/
-
-private/ # For sensitive files like user_credentials.json, client_secrets.json 
+private/
