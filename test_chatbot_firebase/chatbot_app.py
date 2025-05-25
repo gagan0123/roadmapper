@@ -54,7 +54,7 @@ from agents.document_loader.src.vector_search.index_manager import VectorSearchI
 # --- Firebase Initialization ---
 # IMPORTANT: Replace 'path/to/your/serviceAccountKey.json' with the actual path to your key file.
 # Ensure this key file is in your .gitignore to prevent committing it.
-SERVICE_ACCOUNT_KEY_PATH = "test_chatbot_firebase/roadmapper-e7f85-firebase-adminsdk-fbsvc-cac7224d0e.json"
+SERVICE_ACCOUNT_KEY_PATH = "../private/roadmapper-e7f85-firebase-adminsdk-fbsvc-fca400b730.json"
 
 # Ensure GOOGLE_APPLICATION_CREDENTIALS is set if not using the same key as Firebase
 # or if the Firebase key doesn't have Vertex AI/Storage permissions.
