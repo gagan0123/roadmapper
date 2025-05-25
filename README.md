@@ -106,13 +106,6 @@ python -m agents.document_loader.examples.vector_search_example
 - Google Cloud authentication configured
 - GitHub API token (for repository access)
 
-## Documentation
-
-- [Architecture Overview](docs/architecture.md)
-- [Development Guide](docs/development.md)
-- [Deployment Guide](docs/deployment.md)
-- [Individual Agent Documentation](agents/)
-
 ## Contributing
 
 Each agent component can be developed independently. See individual agent READMEs for specific development instructions. 
