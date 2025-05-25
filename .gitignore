@@ -109,7 +109,7 @@ Thumbs.db
 
 # Custom
 token.json  # Google OAuth token
-test_chatbot_firebase/roadmapper-e7f85-firebase-adminsdk-fbsvc-cac7224d0e.json # Firebase Admin SDK key
+test_chatbot_firebase/roadmapper-e7f85-firebase-adminsdk-fbsvc-fca400b730.json # Firebase Admin SDK key
 
 # Data files - if you have large data files you don't want to commit
 # data/some_large_data_file.csv
