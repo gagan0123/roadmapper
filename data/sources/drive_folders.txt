@@ -1,0 +1,7 @@
+# One folder ID per line, optionally followed by a category.
+# Example: 1abc...xyz StrategyDoc
+# Example: 2def...uvw "Product Design Documents"
+# Add your Google Drive folder IDs below:
+
+# 1Z57Io0p0qvda0irRwW2JVM5NYrFNjhyj # Google
+19Zmwt5dFrdwOa-Ce6SVYB862-qgyABLk PRD multimodal

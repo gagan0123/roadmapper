@@ -1,0 +1,6 @@
+# One URL per line, optionally followed by a category.
+# Example: https://example.com Blog
+# Example: https://another.com/page "Research Papers"
+
+https://privacysandbox.com "Product Maketing" text
+https://privacysandbox.google.com/ "Developer Docs" text

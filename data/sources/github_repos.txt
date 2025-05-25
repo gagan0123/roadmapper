@@ -1,0 +1,7 @@
+# One repository per line (owner/repo), optionally followed by a category.
+# Example: google/vertex-ai-samples CodeBase
+# Example: myorg/myrepo "Internal Tools"
+# Add your GitHub repositories below:
+
+# Test Repository
+amedina/roadmapper-loader-test Tools text

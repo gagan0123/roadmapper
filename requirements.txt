@@ -1,0 +1,40 @@
+# Existing Document Loader dependencies
+google-cloud-aiplatform>=1.36.0
+google-cloud-storage>=2.13.0
+google-auth>=2.22.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.100.0
+PyGithub>=2.1.1
+beautifulsoup4>=4.12.2
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+aiohttp>=3.9.0
+tqdm>=4.66.1
+python-slugify>=8.0.1
+tiktoken>=0.5.2
+pdfplumber>=0.10.3
+PyMuPDF>=1.23.0
+PyPDF2>=3.0.0
+
+# ADK and GenKit dependencies
+google-adk>=1.0.0
+genkit>=0.3.2
+
+# Additional agent dependencies
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+networkx>=3.1.0
+
+# Testing and development
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+firebase-admin>=6.0.0
+gradio>=4.0.0 
