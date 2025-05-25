@@ -5,9 +5,16 @@ import time
 from unittest.mock import Mock, patch, MagicMock, call
 from typing import List, Dict, Any
 import tempfile
+from datetime import datetime
 
 from agents.document_loader.src.vector_search.index_manager import VectorSearchIndexManager
 from agents.document_loader.src.models.base import VectorSearchConfig, Embedding
+from google.cloud.aiplatform_v1.types import Index as AiplatformIndex
+from google.cloud.aiplatform_v1.types import IndexEndpoint as AiplatformIndexEndpoint
+from google.cloud import aiplatform
+from google.api_core import operations_v1
+from google.longrunning import operations_pb2
+from google.api_core.operation import Operation as ApiCoreOperation
 
 
 @pytest.fixture
@@ -697,9 +704,30 @@ class TestIntegrationScenarios:
         """Test complete workflow from index creation to search."""
         # Setup mocks
         mock_time.return_value = 1234567890
-        mock_matching_engine_index.create_tree_ah_index.return_value = mock_index
-        mock_matching_engine_endpoint.create.return_value = mock_endpoint
-        mock_index.index_stats.vectors_count = 100
+        
+        # Configure the main index mock for create_tree_ah_index
+        mock_created_index_instance = Mock(spec=aiplatform.MatchingEngineIndex)
+        mock_created_index_instance.name = "projects/test-project/locations/us-central1/indexes/test-index-123"
+        mock_created_index_instance.resource_name = "projects/test-project/locations/us-central1/indexes/test-index-123"
+        mock_created_index_instance.index_stats = Mock()
+        mock_created_index_instance.index_stats.vectors_count = 100
+        mock_matching_engine_index.create_tree_ah_index.return_value = mock_created_index_instance
+
+        # Configure the LRO mock for update_embeddings
+        mock_lro_update_embeddings = Mock(spec=ApiCoreOperation)
+        mock_lro_update_embeddings.done.return_value = True
+        mock_lro_update_embeddings.cancelled.return_value = False
+        mock_lro_update_embeddings.exception.return_value = None
+        mock_lro_update_embeddings.result.return_value = None
+        mock_lro_update_embeddings.operation = Mock()
+        mock_lro_update_embeddings.operation.name = "projects/test-project/locations/us-central1/operations/update-op-123"
+        mock_created_index_instance.update_embeddings.return_value = mock_lro_update_embeddings 
+
+        # Configure the endpoint mock
+        mock_created_endpoint_instance = Mock(spec=aiplatform.MatchingEngineIndexEndpoint)
+        mock_created_endpoint_instance.name = "projects/test-project/locations/us-central1/indexEndpoints/test-endpoint-456"
+        mock_created_endpoint_instance.resource_name = "projects/test-project/locations/us-central1/indexEndpoints/test-endpoint-456"
+        mock_matching_engine_endpoint.create.return_value = mock_created_endpoint_instance
         
         # Storage mocks
         mock_bucket = Mock()
@@ -719,10 +747,12 @@ class TestIntegrationScenarios:
         
         # Execute workflow
         manager = VectorSearchIndexManager(vector_search_config)
+        manager.aiplatform = mock_aiplatform
         
         # Create index
-        index_name = manager.create_index()
-        assert index_name == mock_index.resource_name
+        index_resource_name_returned = manager.create_index()
+        assert index_resource_name_returned == mock_created_index_instance.resource_name
+        assert manager.index is mock_created_index_instance
         
         # Upload embeddings
         gcs_uri = manager.upload_embeddings(sample_embeddings, "test-bucket")
@@ -730,7 +760,7 @@ class TestIntegrationScenarios:
         
         # Deploy index
         endpoint_name = manager.deploy_index(gcs_uri)
-        assert endpoint_name == mock_endpoint.resource_name
+        assert endpoint_name == mock_created_endpoint_instance.resource_name
         
         # Search
         results = manager.search([0.1] * 768, num_neighbors=1)

@@ -111,7 +111,10 @@ class VectorSearchIndexManager:
             # Prepare embeddings data in JSONL format
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Create a unique subdirectory for this batch
-            batch_subdirectory = f"batch_{timestamp}"
+            if file_prefix:
+                batch_subdirectory = f"{file_prefix}_batch_{timestamp}"
+            else:
+                batch_subdirectory = f"batch_{timestamp}"
             gcs_embeddings_directory_path = f"embeddings/{batch_subdirectory}"
             
             filename = f"embeddings.json" # Changed from .jsonl to .json
@@ -176,8 +179,14 @@ class VectorSearchIndexManager:
                     logger.info(f"Index update process completed successfully for GCS directory: {gcs_batch_directory_uri}")
                 else:
                     if update_lro.exception():
-                        logger.error(f"Index update LRO failed with exception: {update_lro.exception()}")
-                        raise update_lro.exception() # Re-raise the LRO exception
+                        lro_exception = update_lro.exception()
+                        logger.error(f"Index update LRO failed with exception: {lro_exception}")
+                        # Ensure we are raising a proper exception instance
+                        if isinstance(lro_exception, BaseException):
+                            raise lro_exception
+                        else:
+                            # If the mock (or actual object) isn't a proper exception, wrap it
+                            raise RuntimeError(f"LRO failed with non-exception object: {lro_exception}")
                     else:
                         logger.warning(f"Index update LRO finished but may not have succeeded (cancelled: {update_lro.cancelled()}). Operation: {update_lro.operation.name}")
             
