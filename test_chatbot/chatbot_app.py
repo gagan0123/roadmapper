@@ -526,6 +526,11 @@ async def perform_test_search():
         return f"Error during test search: {e}"
 
 # --- Chatbot Logic (to be expanded) ---
+# The primary role of get_chatbot_response is to process user input, 
+# augment it with relevant information retrieved from a document corpus 
+# (if available), and then use a large language model (LLM) to generate 
+# a coherent and context-aware response.
+#
 async def get_chatbot_response(user_input, history):
     global text_embedding_processor, vector_search_manager, document_store, llm_model
     
@@ -540,6 +545,11 @@ async def get_chatbot_response(user_input, history):
         # Fallback to LLM without context if vector search components are not ready
         warning_message = "Warning: Vector search components not fully initialized. Querying LLM without document context."
         logger.warning(warning_message)
+        logger.warning(f"  text_embedding_processor ready: {bool(text_embedding_processor)}")
+        logger.warning(f"  vector_search_manager ready: {bool(vector_search_manager)}")
+        if vector_search_manager:
+            logger.warning(f"    vector_search_manager.index ready: {bool(vector_search_manager.index)}")
+            logger.warning(f"    vector_search_manager.deployed_index_id: {vector_search_manager.deployed_index_id}")
         
         # Direct LLM call without context
         try:
@@ -567,6 +577,7 @@ async def get_chatbot_response(user_input, history):
     # Proceed with context retrieval if components are ready
     context_string = "No relevant context found."
     try:
+        logger.info(f"Using deployed_index_id: {vector_search_manager.deployed_index_id} for search.")
         logger.info(f"User input: '{user_input}'. Generating embedding for context retrieval...")
         query_doc = Document(
             id="chat_query", 
@@ -590,21 +601,33 @@ async def get_chatbot_response(user_input, history):
             query_embedding=query_vector,
             num_neighbors=3 
         )
-        logger.info(f"Search completed. Found {len(search_results) if search_results else 0} neighbors.")
+        logger.info(f"Search completed. Raw search_results: {search_results}")
+        logger.info(f"Current document_store keys: {list(document_store.keys())}")
 
         if search_results:
             context_docs = []
-            for result in search_results:
-                doc_id = result.get('id')
-                if doc_id and doc_id in document_store:
-                    # Ensure content is not None before appending
-                    doc_content = document_store[doc_id].content
+            for result_idx, result in enumerate(search_results):
+                doc_id_from_search = result.get('id')
+                logger.info(f"Processing search result #{result_idx + 1}: ID_from_search='{doc_id_from_search}', Score='{result.get('score', 'N/A')}'")
+
+                # Determine the ID to use for document_store lookup
+                lookup_id = doc_id_from_search
+                if doc_id_from_search and '::text_content' in doc_id_from_search:
+                    lookup_id = doc_id_from_search.split('::text_content')[0]
+                    logger.info(f"  Stripped '::text_content' from search ID. Using lookup_id: '{lookup_id}'")
+
+                if lookup_id and lookup_id in document_store:
+                    logger.info(f"  Document ID '{lookup_id}' found in document_store.")
+                    doc_content = document_store[lookup_id].content
                     if doc_content:
-                         context_docs.append(f"Document ID: {doc_id}\nContent:\n{doc_content}\n---")
+                         doc_title = document_store[lookup_id].title or "N/A"
+                         doc_source_type = document_store[lookup_id].source_type or "N/A"
+                         logger.info(f"    Document ID '{lookup_id}' has content. Title: '{doc_title}', SourceType: '{doc_source_type}'. Length: {len(doc_content)} chars.")
+                         context_docs.append(f"Document ID: {lookup_id}\nTitle: {doc_title}\nSource Type: {doc_source_type}\nContent:\n{doc_content}\n---")
                     else:
-                        logger.info(f"Document {doc_id} found in store but has no content.")
+                        logger.info(f"    Document ID '{lookup_id}' found in store but has NO content.")
                 else:
-                    logger.info(f"Document ID {doc_id} from search results not found in document_store or ID is None.")
+                    logger.info(f"  Lookup ID '{lookup_id}' (derived from search ID '{doc_id_from_search}') NOT FOUND in document_store or ID is None.")
             
             if context_docs:
                 context_string = "\n\n".join(context_docs)
@@ -622,9 +645,10 @@ async def get_chatbot_response(user_input, history):
     # Construct prompt for LLM
     prompt_template = f"""You are a helpful AI assistant for the Roadmapper application.
 Your goal is to answer the user's question based on the provided context.
+The context will include a Document ID, Title, Source Type, and Content for each retrieved document.
 If the context is empty or not relevant to the question, try to answer the question based on your general knowledge,
 but clearly state that the information is not from the provided documents.
-If you use information from the context, please cite the Document ID(s) that provided the information.
+If you use information from the context, please cite the Document ID(s) and optionally the title(s) that provided the information.
 
 Context:
 {context_string}
