@@ -107,7 +107,7 @@ class WebLoader(BaseLoader):
                             # Basic filter for image extensions
                             if not parsed_img_url.path.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS):
                                 # print(f"Skipping image with unsupported extension: {absolute_img_url}")
-                                logger.debug(f"Skipping image with unsupported extension: {absolute_img_url}")
+                                pass # Do nothing for unsupported extensions
                                 continue
                             
                             # Add task to download the image
