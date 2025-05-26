@@ -13,9 +13,6 @@ if project_root not in sys.path:
 from dotenv import load_dotenv
 load_dotenv() # Call this early to load .env before other modules might need the variables
 
-import firebase_admin
-from firebase_admin import credentials as firebase_creds # Aliased to avoid confusion
-from firebase_admin import firestore
 import gradio as gr
 import asyncio # Added for async operations
 from typing import Optional, Dict, List
@@ -29,16 +26,16 @@ logger = logging.getLogger(__name__) # Define logger for chatbot_app.py
 # This ensures logger is available for functions defined below like load_user_drive_credentials
 if not logging.getLogger().hasHandlers(): # Check root logger
     # Or check specific logger: if not logger.hasHandlers() and not logger.propagate:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # --- Configuration ---
 # TODO: Replace with your actual GCP project details and desired names
-GCP_PROJECT_ID = "roadmapper-460703" 
+GCP_PROJECT_ID = "roadmapper-460703" # Corrected to match the actual project ID of the index/endpoint
 GCP_LOCATION = "us-west1"
-GCS_BUCKET_NAME = "roadmapper-document-loader" # Create this bucket in your GCP project
-VECTOR_SEARCH_INDEX_NAME = "document-search-index" # This is the display name
-VECTOR_SEARCH_INDEX_ID = "5530728205666746368" # <<< IMPORTANT: SET THIS VALUE
-VECTOR_SEARCH_ENDPOINT_NAME = "doc-loader-test-endpoint"
+GCS_BUCKET_NAME = "roadmapper-embeddings" # Create this bucket in your GCP project
+VECTOR_SEARCH_INDEX_NAME = "document-search-index" # This is the display name (can be the same for the new index type)
+VECTOR_SEARCH_INDEX_ID = "5413634615355113472" # <<< NEW STREAMING INDEX ID
+VECTOR_SEARCH_ENDPOINT_NAME = "doc-loader-test-endpoint" # We can reuse this or make a new one
 
 # --- Document Loader Agent Imports ---
 from agents.document_loader.src.data_source_loader import DataSourceLoader
@@ -51,24 +48,24 @@ from agents.document_loader.src.processors.text_embedding_processor import TextE
 from agents.document_loader.src.models.base import VectorSearchConfig, Document, Embedding
 from agents.document_loader.src.vector_search.index_manager import VectorSearchIndexManager
 
-# --- Firebase Initialization ---
-# IMPORTANT: Replace 'path/to/your/serviceAccountKey.json' with the actual path to your key file.
-# Ensure this key file is in your .gitignore to prevent committing it.
-SERVICE_ACCOUNT_KEY_PATH = "../private/roadmapper-e7f85-firebase-adminsdk-fbsvc-fca400b730.json"
+# IMPORTANT: GOOGLE_APPLICATION_CREDENTIALS should be set in the .env file
+# and point to the correct service account key JSON file.
+# The logic below relies on this environment variable.
 
-# Ensure GOOGLE_APPLICATION_CREDENTIALS is set if not using the same key as Firebase
-# or if the Firebase key doesn't have Vertex AI/Storage permissions.
-# It's often simpler to set the environment variable.
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_KEY_PATH 
+# Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly via .env
+cred_path_from_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-try:
-    cred = firebase_creds.Certificate(SERVICE_ACCOUNT_KEY_PATH)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("Firebase initialized successfully.")
-except Exception as e:
-    print(f"Error initializing Firebase: {e}")
-    db = None
+if cred_path_from_env and os.path.exists(cred_path_from_env):
+    logger.info(f"Using GOOGLE_APPLICATION_CREDENTIALS from environment: {cred_path_from_env}")
+    # No explicit Firebase init needed, Google libraries will pick this up.
+else:
+    logger.error("CRITICAL: The GOOGLE_APPLICATION_CREDENTIALS environment variable is not set, "
+                 "is empty, or points to a non-existent file. "
+                 "Please ensure it is correctly defined in your .env file and points to a "
+                 "valid service account key JSON. Google Cloud services (Vertex AI, GCS) "
+                 "will likely fail to initialize or operate correctly.")
+    # Depending on how critical immediate auth is, you might even raise an exception:
+    # raise EnvironmentError("GOOGLE_APPLICATION_CREDENTIALS not set or invalid. Application cannot proceed.")  
 
 # --- Global Variables for Document Loading Components ---
 data_source_loader: Optional[DataSourceLoader] = None
@@ -163,9 +160,23 @@ async def initialize_document_pipeline():
         retrieved_index = vector_search_manager.get_index(index_resource_name=index_resource_name)
         if retrieved_index:
             print(f"Successfully retrieved existing index: {retrieved_index.name}")
+            # Now ensure it's deployed to our target endpoint
+            print(f"Ensuring index {retrieved_index.name} is deployed to endpoint '{VECTOR_SEARCH_ENDPOINT_NAME}'...")
+            deployed_successfully = await asyncio.to_thread(
+                vector_search_manager.ensure_index_deployed, 
+                VECTOR_SEARCH_ENDPOINT_NAME
+            )
+            if deployed_successfully:
+                print(f"Index {retrieved_index.name} is successfully deployed to endpoint '{VECTOR_SEARCH_ENDPOINT_NAME}'.")
+                # vector_search_manager.deployed_index_id should now be set by ensure_index_deployed
+            else:
+                logger.error(f"Failed to ensure index {retrieved_index.name} is deployed to endpoint '{VECTOR_SEARCH_ENDPOINT_NAME}'. Upserts and searches might fail.")
+                # Optionally, return False here if deployment is critical for startup
+                # return False 
         else:
             logger.warning(f"Failed to retrieve index using ID '{VECTOR_SEARCH_INDEX_ID}'. It might not exist or there was an error.")
             # Not returning False here, as the manager is init, but index isn't populated in self.index of manager
+            # However, if get_index fails, ensure_index_deployed won't be called.
 
         print("FULL document pipeline initialization attempt complete.")
         return True 
@@ -240,23 +251,34 @@ async def trigger_document_loading_and_indexing():
         github_repos_config = data_source_loader.load_github_repos()
         if github_repos_config:
             print(f"Found {len(github_repos_config)} GitHub repo configurations to process.")
-            for repo_config_path, category, model_type in github_repos_config: # Renamed repo_path to repo_config_path for clarity
-                print(f"  Processing GitHub repo: {repo_config_path} (Category: {category}, Model Type: {model_type})")
+            # Get GITHUB_TOKEN from environment once, if available
+            github_token = os.getenv('GITHUB_TOKEN')
+            if not github_token:
+                print("Warning: GITHUB_TOKEN environment variable not set. Private repos or high-rate API access might fail.")
+                logger.warning("GITHUB_TOKEN environment variable not set. GitHubLoader might have limited access.")
+
+            for repo_config_name, category, model_type in github_repos_config: # Changed repo_path to repo_config_name
+                print(f"  Processing GitHub repo: {repo_config_name} (Category: {category}, Model Type: {model_type})")
                 try:
                     github_loader = GitHubLoader(
-                        repo_name=repo_config_path, # Corrected: repo_path to repo_name
+                        repo_name=repo_config_name, # This is the 'owner/repo' string
+                        token=github_token, # Pass the token
                         category=category,
                         embedding_model_type=model_type
-                        # Add credentials if GitHubLoader supports them, e.g., token
                     )
-                    # Add connection validation if GitHubLoader has it
-                    # async for doc in github_loader.load():
-                    # all_loaded_documents.append(doc)
-                    # print(f"  Finished loading from GitHub repo {repo_config_path}.")
-                    print(f"  GitHub loader for {repo_config_path} not fully implemented in this flow yet. Skipping actual loading.")
+                    
+                    if not await github_loader.validate_connection():
+                        print(f"  Failed to validate connection for GitHub repo {repo_config_name}. Skipping.")
+                        logger.warning(f"Failed to validate connection for GitHub repo {repo_config_name}. Skipping.")
+                        continue
+                    
+                    async for doc in github_loader.load(): # Iterate async generator
+                        if doc:
+                            all_loaded_documents.append(doc)
+                    print(f"  Finished loading from GitHub repo {repo_config_name}.")
                 except Exception as e:
-                    print(f"  Error processing GitHub repo {repo_config_path}: {e}")
-                    logger.error(f"Error processing GitHub repo {repo_config_path}: {e}", exc_info=True)
+                    print(f"  Error processing GitHub repo {repo_config_name}: {e}")
+                    logger.error(f"Error processing GitHub repo {repo_config_name}: {e}", exc_info=True)
         else:
             print("No GitHub sources configured in github_repos.txt.")
 
@@ -268,15 +290,20 @@ async def trigger_document_loading_and_indexing():
                 print(f"  Processing Web URL: {single_url} (Category: {category}, Model Type: {model_type})")
                 try:
                     web_loader = WebLoader(
-                        urls=[single_url], # Corrected: url to urls=[single_url]
+                        urls=[single_url], # WebLoader expects a list of URLs
                         category=category,
                         embedding_model_type=model_type
                     )
-                    # Add connection validation if WebLoader has it
-                    # async for doc in web_loader.load():
-                    # all_loaded_documents.append(doc)
-                    # print(f"  Finished loading from Web URL {single_url}.")
-                    print(f"  Web loader for {single_url} not fully implemented in this flow yet. Skipping actual loading.")
+                    # Validate connection (optional, but good for early feedback)
+                    if not await web_loader.validate_connection():
+                        print(f"  Failed to validate connection for WebLoader with URL {single_url}. Skipping.")
+                        logger.warning(f"Failed to validate connection for WebLoader with URL {single_url}. Skipping.")
+                        continue
+                    
+                    async for doc in web_loader.load(): # Iterate async generator
+                        if doc:
+                            all_loaded_documents.append(doc)
+                    print(f"  Finished loading from Web URL {single_url}.")
                 except Exception as e:
                     print(f"  Error processing Web URL {single_url}: {e}")
                     logger.error(f"Error processing Web URL {single_url}: {e}", exc_info=True)
@@ -367,15 +394,15 @@ async def trigger_document_loading_and_indexing():
         status_message = f"Generated {len(embeddings_for_indexing)} embeddings. Uploading to GCS and indexing..."
         print(status_message)
 
-        # 4. Upload to GCS and Index
-        if not GCS_BUCKET_NAME or GCS_BUCKET_NAME == "roadmapper-document-loader": 
-            pass # GCS_BUCKET_NAME is defined from config, this check is okay.
+        # 4. Upload to GCS and Index (Old Batch Method) / Upsert to Index (New Streaming Method)
+        # if not GCS_BUCKET_NAME or GCS_BUCKET_NAME == "roadmapper-document-loader": 
+        #     pass # GCS_BUCKET_NAME is defined from config, this check is okay.
 
-        # This is the line you'll manually fix the indentation for:
         if not vector_search_manager.index:
             error_msg = "ERROR: VectorSearchIndexManager does not have a valid index retrieved. Cannot add documents."
             print(error_msg)
             logger.error(error_msg)
+            # Attempt to re-retrieve and deploy (this logic might be redundant if init fails robustly)
             index_resource_name = f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}/indexes/{VECTOR_SEARCH_INDEX_ID}"
             print(f"Attempting to re-retrieve Vertex AI Index: {index_resource_name}")
             retrieved_index = vector_search_manager.get_index(index_resource_name=index_resource_name)
@@ -383,33 +410,34 @@ async def trigger_document_loading_and_indexing():
                 fatal_error_msg = "Fatal: Failed to re-retrieve index. Indexing cannot proceed."
                 print(fatal_error_msg)
                 return fatal_error_msg
-            print(f"Successfully re-retrieved index: {retrieved_index.name}")
+            print(f"Successfully re-retrieved index: {retrieved_index.name}. Ensuring deployment...")
+            deployed_successfully = await asyncio.to_thread(vector_search_manager.ensure_index_deployed, VECTOR_SEARCH_ENDPOINT_NAME)
+            if not deployed_successfully:
+                fatal_error_msg = f"Fatal: Failed to ensure re-retrieved index {retrieved_index.name} is deployed. Indexing cannot proceed."
+                print(fatal_error_msg)
+                return fatal_error_msg
         
-        # The upload_embeddings method in VectorSearchIndexManager will create its own GCS file structure.
-        # We just need to pass the embeddings and the bucket name.
-        print(f"Attempting to upload {len(embeddings_for_indexing)} embeddings to GCS and update index via VectorSearchIndexManager...")
+        # Check if index is deployed (via ensure_index_deployed in init or re-check here)
+        # The new upsert_datapoints method in VectorSearchIndexManager doesn't strictly need self.deployed_index_id,
+        # as it calls self.index.upsert_datapoints(). However, a deployed index is needed for searching.
+        # The ensure_index_deployed method should set self.deployed_index_id if successful.
+        if not vector_search_manager.deployed_index_id:
+             logger.warning("Index does not seem to be deployed to an endpoint according to VectorSearchIndexManager state. Searching will fail. Upserting might proceed directly to index if configured for streaming.")
+             # For streaming, self.index.upsert_datapoints() is the key.
+
+        print(f"Attempting to upsert {len(embeddings_for_indexing)} embeddings to index via streaming using VectorSearchIndexManager...")
         
-        # Call the synchronous method upload_embeddings
-        # It handles creating the JSONL file in GCS and updating the index.
-        gcs_file_uri_or_response = vector_search_manager.upload_embeddings(
-            embeddings=embeddings_for_indexing,
-            bucket_name=GCS_BUCKET_NAME
-            # The file_prefix is optional in upload_embeddings and not strictly needed here yet.
+        await asyncio.to_thread(
+            vector_search_manager.upsert_datapoints,
+            embeddings=embeddings_for_indexing
         )
 
-        # upload_embeddings returns the GCS URI of the uploaded file.
-        if gcs_file_uri_or_response: 
-            final_message = f"Successfully loaded {len(all_loaded_documents)} docs, generated {len(embeddings_for_indexing)} embeddings. Index update initiated with GCS data. GCS file URI: {gcs_file_uri_or_response}"
-            print(final_message)
-            logger.info(final_message)
-            return final_message
-        else:
-            # This case might not be hit if upload_embeddings raises an exception on failure.
-            # Depending on its error handling, it might return None or an empty string on some failures.
-            error_message = f"Failed to initiate index update. {len(embeddings_for_indexing)} embeddings were generated. Check logs for details from VectorSearchIndexManager."
-            print(error_message)
-            logger.error(error_message)
-            return error_message
+        # Streaming upsert is typically fire-and-forget from client's perspective for LROs
+        # The method itself logs success/failure of the call.
+        final_message = f"Successfully initiated streaming upsert of {len(embeddings_for_indexing)} embeddings to index {vector_search_manager.index.name if vector_search_manager.index else 'N/A'}."
+        print(final_message)
+        logger.info(final_message)
+        return final_message
 
     except Exception as e:
         error_msg = f"Error during document loading and indexing: {e}"
@@ -417,6 +445,76 @@ async def trigger_document_loading_and_indexing():
         logger.error(error_msg, exc_info=True)
         traceback.print_exc()
         return f"Error: {e}"
+
+async def perform_test_search():
+    """Performs a test search against the configured index."""
+    global text_embedding_processor, vector_search_manager
+    status_message = "Performing test search..."
+    print(status_message)
+
+    if not text_embedding_processor or not vector_search_manager:
+        error_msg = "ERROR: TextEmbeddingProcessor or VectorSearchManager not initialized."
+        print(error_msg)
+        return error_msg
+    
+    if not vector_search_manager.index or not vector_search_manager.deployed_index_id:
+        error_msg = "ERROR: VectorSearchManager does not have a deployed index. Cannot search."
+        print(error_msg)
+        return error_msg
+
+    test_query = "What is the Privacy Sandbox?"
+    print(f"Test query: '{test_query}'")
+
+    try:
+        print("Generating embedding for the test query...")
+        # Create a dummy Document object for the query to pass to the embedding processor
+        query_doc = Document(
+            id="test_query_doc", 
+            content=test_query, 
+            category="query", 
+            embedding_model_type="text",
+            title="Test Query Document",  # Added
+            source_type="internal_query", # Added
+            source_url="N/A"             # Added
+        )
+        query_embeddings = await text_embedding_processor.generate_embeddings(documents=[query_doc])
+        
+        if not query_embeddings or not query_embeddings[0].embedding:
+            error_msg = "Failed to generate embedding for the test query."
+            print(error_msg)
+            return error_msg
+        
+        query_vector = query_embeddings[0].embedding
+        print(f"Query embedding generated successfully (vector dim: {len(query_vector) if query_vector else 0}).")
+
+        print(f"Searching index {vector_search_manager.index.name} on endpoint {vector_search_manager.endpoint.name} (deployed_id: {vector_search_manager.deployed_index_id})...")
+        
+        # Perform search using asyncio.to_thread as search might be blocking
+        search_results = await asyncio.to_thread(
+            vector_search_manager.search,
+            query_embedding=query_vector,
+            num_neighbors=3 # Request top 3 neighbors
+        )
+
+        print("Test search completed.")
+        if search_results:
+            print("Search Results:")
+            for i, result in enumerate(search_results):
+                print(f"  {i+1}. ID: {result.get('id')}, Score: {result.get('score'):.4f} (Distance: {result.get('distance'):.4f})")
+                # Optionally, retrieve and show document content if we have a way to map ID back to content
+                # if result.get('id') in document_store:
+                #     print(f"     Content snippet: {document_store[result.get('id')].content[:100]}...")
+            return f"Test search successful. Found {len(search_results)} results (see console)."
+        else:
+            print("No results found for the test query.")
+            return "Test search completed. No results found."
+
+    except Exception as e:
+        error_msg = f"Error during test search: {e}"
+        print(error_msg)
+        logger.error(error_msg, exc_info=True)
+        traceback.print_exc()
+        return f"Error during test search: {e}"
 
 # --- Chatbot Logic (to be expanded) ---
 def get_chatbot_response(user_input, history):
@@ -428,70 +526,11 @@ def get_chatbot_response(user_input, history):
     
     bot_response = f"Echo: {user_input}" # Simple echo for now
     
-    # Example: Save to Firestore (optional)
-    if db:
-        try:
-            chat_ref = db.collection('chats').document()
-            chat_ref.set({
-                'user_input': user_input,
-                'bot_response': bot_response,
-                'timestamp': firestore.SERVER_TIMESTAMP
-            })
-        except Exception as e:
-            print(f"Error saving chat to Firebase: {e}")
-            
     return bot_response
 
 # --- Gradio UI ---
-async def chat_interface_with_startup():
-    # Initialize the document pipeline on startup
-    # In a real app, you might do this in a separate startup script or event
-    # For Gradio, we can try to run it before launching the interface
-    success = await initialize_document_pipeline()
-    if not success:
-        print("WARNING: Document pipeline failed to initialize. Document loading features will not work.")
-        # Optionally, disable parts of the UI or show a persistent error message
-
-    iface = gr.ChatInterface(
-        fn=get_chatbot_response,
-        title="Roadmapped Test Chatbot",
-        description="Ask questions before and after embedding documents to test the document loader agent. Ensure GCP settings are correct.",
-        chatbot=gr.Chatbot(height=600),
-        # TODO: Add UI elements for triggering document loading
-    )
-    
-    # Add a button to trigger document loading
-    with iface.blocks as demo:
-        # Re-create the chat interface parts if you need to mix with other gr.Blocks
-        # For just adding a button, we might need to structure it differently or use gr.Blocks directly
-        # For simplicity with gr.ChatInterface, let's add a button separately if possible, 
-        # or integrate it if we switch to full gr.Blocks.
-        # A simple way with current structure is to have a separate button that calls the function.
-        # This might not integrate perfectly into the ChatInterface layout itself without more advanced Gradio usage.
-        # For now, let's assume we can add a button that appears alongside or above/below.
-        pass # Placeholder for now, will adjust UI structure in a moment
-
-    # A better way to add custom components with gr.ChatInterface:
-    with gr.Blocks() as demo:
-        gr.Markdown("Roadmapper Test Chatbot")
-        gr.Markdown("Ask questions before and after embedding documents to test the document loader agent. Ensure GCP settings are correct.")
-        
-        with gr.Row():
-            load_docs_button = gr.Button("Load and Index Documents")
-            # TODO: Add status indicators here, e.g., gr.Textbox(label="Status", interactive=False)
-        
-        chatbot_component = gr.Chatbot(height=500, label="Chat")
-        msg_input = gr.Textbox(label="Your message:", show_label=False, placeholder="Type your message here...")
-        clear_button = gr.Button("Clear Chat")
-
-        # Wire up the chat logic
-        msg_input.submit(get_chatbot_response, [msg_input, chatbot_component], [msg_input, chatbot_component])
-        clear_button.click(lambda: (None, None), None, [msg_input, chatbot_component], queue=False)
-
-        # Wire up the button to the STUBBED ASYNC trigger_document_loading_and_indexing function
-        load_docs_button.click(trigger_document_loading_and_indexing, [], [])
-
-    demo.launch()
+# Removed redundant chat_interface_with_startup() function.
+# The UI is now solely defined and launched within run_app().
 
 # --- Simple Test Function for Button Click Debugging (Can be commented out or removed now) ---
 # async def simple_test_button_click(): 
@@ -509,6 +548,7 @@ async def run_app():
         
         with gr.Row():
             load_docs_button = gr.Button("Load and Index Documents")
+            test_search_button = gr.Button("Perform Test Search") # Add new button
             status_display = gr.Textbox(label="Status", interactive=False, lines=2, max_lines=5)
         
         chatbot_component = gr.Chatbot(height=500, label="Chat")
@@ -520,6 +560,7 @@ async def run_app():
 
         # Wire up the button to the STUBBED ASYNC trigger_document_loading_and_indexing function
         load_docs_button.click(trigger_document_loading_and_indexing, [], [status_display])
+        test_search_button.click(perform_test_search, [], [status_display]) # Wire the new button
 
     print("DEBUG: $$$ ABOUT TO CALL demo.launch() $$$ DEBUG")
     demo.launch()

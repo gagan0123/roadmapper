@@ -127,8 +127,8 @@ class VectorSearchIndexManager:
                         "id": embedding.document_id,
                         "embedding": embedding.embedding,
                         "restricts": [
-                            {"namespace": "category", "allow": [embedding.category or "default"]},
-                            {"namespace": "source_type", "allow": [embedding.metadata.get("source_type", "unknown")]}
+                            {"namespace": "category", "allow_list": [embedding.category or "default"]},
+                            {"namespace": "source_type", "allow_list": [embedding.metadata.get("source_type", "unknown")]}
                         ]
                     }
                     f.write(json.dumps(embedding_data) + '\n')
@@ -169,10 +169,14 @@ class VectorSearchIndexManager:
             if self.index:
                 logger.info(f"Updating index with embeddings from GCS directory: {gcs_batch_directory_uri}")
                 update_lro = self.index.update_embeddings(contents_delta_uri=gcs_batch_directory_uri)
-                logger.info(f"Index update LRO initiated: {update_lro.operation.name}. Waiting for completion...")
+                logger.info(f"Index update LRO initiated: {update_lro.name}. Waiting for completion...")
                 
                 # Wait for the LRO to complete
+                start_time_lro_wait = time.time()
+                logger.info(f"Waiting for LRO {update_lro.name} to complete (blocking call to .result())...")
                 update_lro.result() # This will block until the LRO is done
+                end_time_lro_wait = time.time()
+                logger.info(f"LRO {update_lro.name} .result() call finished. Duration: {end_time_lro_wait - start_time_lro_wait:.2f} seconds.")
                 
                 # Check LRO status (though result() would raise an exception on failure)
                 if update_lro.done() and not update_lro.cancelled() and not update_lro.exception():
@@ -188,7 +192,7 @@ class VectorSearchIndexManager:
                             # If the mock (or actual object) isn't a proper exception, wrap it
                             raise RuntimeError(f"LRO failed with non-exception object: {lro_exception}")
                     else:
-                        logger.warning(f"Index update LRO finished but may not have succeeded (cancelled: {update_lro.cancelled()}). Operation: {update_lro.operation.name}")
+                        logger.warning(f"Index update LRO finished but may not have succeeded (cancelled: {update_lro.cancelled()}). Operation: {update_lro.name}")
             
             return gcs_file_uri # Return the specific file URI as it's still useful info
             
@@ -266,6 +270,190 @@ class VectorSearchIndexManager:
             logger.error(f"Error deploying index: {e}")
             raise
 
+    def ensure_index_deployed(self, endpoint_display_name: str,
+                              min_replica_count: int = 1, max_replica_count: int = 1) -> bool:
+        """Ensures the current self.index is deployed to an endpoint with the given display name.
+           Creates the endpoint if it doesn't exist. Deploys the index if not already deployed there.
+           Returns True if successfully deployed (or already deployed), False otherwise.
+        """
+        if not self.index:
+            logger.error("No index loaded (self.index is None). Cannot ensure deployment.")
+            return False
+
+        found_existing_deployment = False
+        active_endpoint_obj = None  # To store the endpoint object if found or created
+
+        try:
+            endpoints = MatchingEngineIndexEndpoint.list()
+            for ep in endpoints:
+                logger.debug(f"Checking endpoint: DisplayName='{ep.display_name}', Name='{ep.name}'")
+                if ep.display_name == endpoint_display_name:
+                    logger.info(f"Found existing endpoint '{endpoint_display_name}' with resource name: {ep.name}")
+                    active_endpoint_obj = ep
+                    
+                    logger.debug(f"Endpoint {ep.name} has {len(ep.deployed_indexes)} deployed index(es).")
+                    if not self.index:  # Should not happen
+                        logger.error("self.index became None unexpectedly during endpoint check.")
+                        return False
+                    logger.debug(f"Target index for deployment: self.index.name='{self.index.name}', self.index.display_name='{self.index.display_name}'")
+                    logger.debug(f"  (Target attributes: ProjID='{self.index.project}', Loc='{self.index.location}', IndexID='{self.index.name.split('/')[-1]}')")
+
+                    for deployed_index_obj in ep.deployed_indexes:
+                        # deployed_index_obj.index is like "projects/PROJECT_NUMBER/locations/LOCATION/indexes/INDEX_ID"
+                        
+                        expected_location = self.index.location
+                        expected_index_id = self.index.name.split('/')[-1]
+
+                        deployed_name_parts = deployed_index_obj.index.split('/')
+                        # actual_project_identifier = deployed_name_parts[1] # This is the project number or ID
+                        actual_location_str = deployed_name_parts[3]
+                        actual_index_id_str = deployed_name_parts[5]
+
+                        logger.debug(f"  Inspecting deployed index on endpoint: DeployedIndex.id='{deployed_index_obj.id}', DeployedIndex.index (resource_name)='{deployed_index_obj.index}', DeployedIndex.display_name='{deployed_index_obj.display_name}'")
+                        logger.debug(f"    Parsed from DeployedIndex.index: Loc='{actual_location_str}', IndexID='{actual_index_id_str}'")
+                        
+                        # Match if location and the final index ID are the same.
+                        # The project part of deployed_index_obj.index uses Project Number, while self.index.project is Project ID.
+                        # As long as the endpoint 'ep' was found correctly (assumed to be in our target project by its display_name),
+                        # matching location and index ID should be sufficient.
+                        match = (
+                            actual_location_str == expected_location and
+                            actual_index_id_str == expected_index_id
+                        )
+
+                        if match:
+                            logger.info(f"SUCCESS: Index (Loc:{expected_location}, ID:{expected_index_id}) is ALREADY DEPLOYED to endpoint {ep.name} with DeployedIndex.id: {deployed_index_obj.id}")
+                            self.endpoint = active_endpoint_obj
+                            self.deployed_index_id = deployed_index_obj.id
+                            found_existing_deployment = True
+                            return True # Critical: Return True as soon as existing deployment is confirmed
+                        else:
+                            logger.debug(f"    MISMATCH with target. LocMatch={actual_location_str == expected_location}, IndexIDMatch={actual_index_id_str == expected_index_id}")
+                    
+                    if not found_existing_deployment:
+                         logger.info(f"Index {self.index.name} (DisplayName: {self.index.display_name}) was NOT FOUND on existing endpoint {ep.name} (DisplayName: {ep.display_name}). Will proceed to deploy to this endpoint.")
+                    # Important: if endpoint is found, we break out of the ENDPOINT loop to use this active_endpoint_obj
+                    break 
+            
+            if not active_endpoint_obj:
+                logger.info(f"Endpoint '{endpoint_display_name}' not found. Creating it...")
+                created_endpoint_name = self.create_endpoint(endpoint_name=endpoint_display_name)
+                if not self.endpoint or not created_endpoint_name:
+                    logger.error(f"Failed to create or retrieve endpoint '{endpoint_display_name}'. self.endpoint is {self.endpoint}")
+                    return False
+                active_endpoint_obj = self.endpoint
+                logger.info(f"Successfully created endpoint: {active_endpoint_obj.name} (DisplayName: {active_endpoint_obj.display_name})")
+            
+            # If found_existing_deployment is True here, it means we returned from inside the loop.
+            # This part of the code should only be reached if a deployment is needed.
+            if found_existing_deployment:
+                 # This state should ideally not be reached if return True was effective.
+                 logger.warning("Reached post-loop check with found_existing_deployment=True. This might indicate a logic flow issue if not intended.")
+                 if self.endpoint and self.deployed_index_id:
+                     return True # If state is consistent, still okay.
+                 else:
+                     logger.error("Inconsistent state: found_existing_deployment is true, but endpoint/deployed_index_id might be missing.")
+                     return False
+
+            logger.info(f"Proceeding to deploy index {self.index.name} (DisplayName: {self.index.display_name}) to endpoint {active_endpoint_obj.name} (DisplayName: {active_endpoint_obj.display_name})...")
+            self.endpoint = active_endpoint_obj # Ensure self.endpoint is the one we want to deploy to
+
+            index_name_part = self.index.name.split('/')[-1][:30].replace('-', '_').replace('.', '_') # Sanitize further for ID
+            deployment_id = f"dp_{index_name_part}_{int(time.time())}"
+            logger.info(f"Generated deployment_id for Vertex AI: {deployment_id}")
+
+            deploy_lro = self.endpoint.deploy_index(
+                index=self.index,
+                deployed_index_id=deployment_id,
+                display_name=f"Deployment of {self.index.display_name[:30]} at {int(time.time())}",
+                min_replica_count=min_replica_count,
+                max_replica_count=max_replica_count,
+            )
+            logger.info(f"Deploy index LRO initiated: {deploy_lro.operation.name}. Waiting for completion (this may take 20-60 minutes for new deployments)...")
+            deploy_lro.result() 
+            logger.info(f"Index {self.index.name} successfully deployed to endpoint {self.endpoint.name}. Target DeployedIndex ID was: {deployment_id}")
+            
+            # After deployment, confirm the deployed_index_id by fetching a fresh state of the endpoint.
+            refreshed_deployed_id_from_new_deploy = None
+            try:
+                freshly_retrieved_endpoint = MatchingEngineIndexEndpoint(self.endpoint.name)
+                for dep_idx in freshly_retrieved_endpoint.deployed_indexes:
+                    # We are looking for the specific deployment we just made.
+                    if dep_idx.index == self.index.name and dep_idx.id == deployment_id:
+                        refreshed_deployed_id_from_new_deploy = dep_idx.id
+                        break
+            except Exception as ex_refresh:
+                logger.warning(f"Could not refresh endpoint state after deployment to confirm deployed_index_id: {ex_refresh}")
+            
+            if refreshed_deployed_id_from_new_deploy:
+                self.deployed_index_id = refreshed_deployed_id_from_new_deploy
+                logger.info(f"Confirmed DeployedIndex ID after new deployment: {self.deployed_index_id}")
+            else:
+                self.deployed_index_id = deployment_id # Fallback to the ID we generated
+                logger.warning(f"Could not confirm DeployedIndex ID by refreshing endpoint after new deployment. Using generated ID: {self.deployed_index_id}. Manual check advised.")
+            return True
+
+        except Exception as ex: # Changed 'e' to 'ex'
+            logger.error(f"Error in ensure_index_deployed for index '{self.index.name if self.index else 'Unknown Index'}' to endpoint '{endpoint_display_name}': {ex}", exc_info=True)
+            if self.index:
+                logger.error(f"Context: Index DisplayName='{self.index.display_name}'")
+            return False
+
+    def upsert_datapoints(self, embeddings: List[Embedding]) -> None:
+        """Upsert datapoints (embeddings) to the index using streaming. 
+           Assumes self.index is already set and the index is deployed to an endpoint.
+        """
+        if not self.index:
+            logger.error("No index available. Cannot upsert datapoints.")
+            raise ValueError("Index not initialized. Call get_index() first.")
+
+        if not self.endpoint or not self.deployed_index_id:
+            # This check might be too strict if upsert_datapoints can work on an index
+            # not yet deployed for querying, but typically an endpoint is needed for writes too.
+            # For now, let's assume it requires a deployed index as per search().
+            # The SDK might allow upserting to an index resource directly without an endpoint, 
+            # but then searching that index would require deploying it.
+            # Let's assume for consistency with search, an endpoint context is good.
+            # UPDATE: According to Vertex AI docs, upsert_datapoints is a method of MatchingEngineIndex,
+            # not MatchingEngineIndexEndpoint. So, we only need self.index.
+            # We still need the index to be *configured* for streaming updates.
+            pass # Endpoint not strictly needed for index.upsert_datapoints
+
+        datapoints_to_upsert = []
+        for embedding in embeddings:
+            # Ensure embedding vector is a list of floats as expected by the SDK
+            # The model produces numpy arrays or lists, ensure it's the latter for JSON serialization if needed by underlying calls,
+            # though upsert_datapoints might handle numpy arrays directly.
+            # For safety, let's assume list of floats.
+            embedding_vector = [float(val) for val in embedding.embedding]
+            
+            datapoint = {
+                "datapoint_id": embedding.document_id,
+                "feature_vector": embedding_vector,
+                "restricts": [
+                    {"namespace": "category", "allow_list": [embedding.category or "default"]},
+                    # Convert source_type from metadata to a restrict
+                    {"namespace": "source_type", "allow_list": [embedding.metadata.get("source_type", "unknown")]}
+                ]
+                # "crowding_tag" can be added if needed
+            }
+            datapoints_to_upsert.append(datapoint)
+        
+        if not datapoints_to_upsert:
+            logger.info("No datapoints to upsert.")
+            return
+
+        try:
+            logger.info(f"Upserting {len(datapoints_to_upsert)} datapoints to index {self.index.name} via streaming...")
+            # The upsert_datapoints method is on the MatchingEngineIndex object itself.
+            self.index.upsert_datapoints(datapoints=datapoints_to_upsert)
+            logger.info(f"Successfully initiated upsert for {len(datapoints_to_upsert)} datapoints to index {self.index.name}.")
+            # Streaming upserts are generally fast to initiate. 
+            # The actual indexing might take a short while in the background.
+        except Exception as e:
+            logger.error(f"Error upserting datapoints to index {self.index.name}: {e}", exc_info=True)
+            raise
+
     def _wait_for_index_ready(self, timeout: int = 3600, check_interval: int = 30) -> None:
         """Wait for index to be ready after embedding update."""
         logger.info("Waiting for index to be ready...")
@@ -290,54 +478,57 @@ class VectorSearchIndexManager:
         
         raise TimeoutError(f"Index not ready after {timeout} seconds")
 
-    def search(self, query_embedding: List[float], num_neighbors: int = 5, 
-              filter_criteria: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Search the index for similar vectors."""
+    def search(self, query_embedding: List[float], num_neighbors: int = 5,
+               filter_criteria: Optional[List[Dict[str, List[str]]]] = None) -> List[Dict[str, Any]]:
+        """Search the index for similar vectors using the endpoint's find_neighbors method."""
+        if not self.endpoint or not self.deployed_index_id:
+            logger.error("Cannot search: Index not deployed or endpoint not set.")
+            raise Exception("Index not deployed. Ensure deployment first.")
+
         try:
-            if not self.endpoint or not self.deployed_index_id:
-                raise Exception("Index not deployed. Call deploy_index() first.")
+            logger.debug(f"Performing search on deployed_index_id: {self.deployed_index_id} with {num_neighbors} neighbors using endpoint.find_neighbors.")
             
-            # Prepare the query instance for Vertex AI Vector Search
-            query_instance = {
-                "deployed_index_id": self.deployed_index_id,
-                "queries": [{
-                    "embedding": query_embedding,
-                    "neighbor_count": num_neighbors
-                }]
-            }
-            
-            if filter_criteria:
-                query_instance["queries"][0]["filters"] = filter_criteria
-            
-            # Call predict directly with endpoint and instances
-            response = self.prediction_client.predict(
-                endpoint=self.endpoint.resource_name,
-                instances=[query_instance]
-            )
-            
-            # Parse results
-            results = []
-            if response.predictions:
-                for prediction in response.predictions:
-                    # Parse the prediction response format
-                    if isinstance(prediction, Value):
-                        prediction_dict = json_format.MessageToDict(prediction)
+            sdk_filters = []
+            if filter_criteria: 
+                # Expecting filter_criteria = [{"namespace": "ns1", "allow_list": ["token1"]}, ...]
+                for fc_item in filter_criteria:
+                    namespace_name = fc_item.get("namespace")
+                    allow_tokens_list = fc_item.get("allow_list") # Changed from allow to allow_list
+                    if namespace_name and allow_tokens_list is not None: # Ensure allow_list can be empty if intended
+                        sdk_filters.append(
+                            aiplatform.matching_engine.matching_engine_index_endpoint.Namespace(
+                                name=namespace_name,
+                                allow_tokens=allow_tokens_list
+                            )
+                        )
                     else:
-                        prediction_dict = prediction
-                    
-                    neighbors = prediction_dict.get("neighbors", [])
-                    for neighbor in neighbors:
-                        results.append({
-                            "id": neighbor.get("id"),
-                            "distance": neighbor.get("distance"),
-                            "score": 1 - neighbor.get("distance", 1)  # Convert distance to similarity score
-                        })
+                        logger.warning(f"Skipping filter item due to missing namespace or allow_list: {fc_item}")
+                logger.debug(f"Constructed SDK filters for find_neighbors: {sdk_filters}")
             
-            logger.info(f"Search returned {len(results)} results")
+            # find_neighbors returns a list of lists of ReadIndexDatapointsResponse.Neighbor
+            # Each inner list corresponds to a query. Since we send one query, we get results[0].
+            find_neighbors_response = self.endpoint.find_neighbors(
+                deployed_index_id=self.deployed_index_id,
+                queries=[query_embedding], # find_neighbors expects a list of query vectors
+                num_neighbors=num_neighbors,
+                filter=sdk_filters if sdk_filters else [] # Pass empty list if no filters
+            )
+
+            results = []
+            # find_neighbors_response is List[List[Neighbor]]
+            if find_neighbors_response and find_neighbors_response[0]: 
+                for neighbor_match in find_neighbors_response[0]: # Get neighbors for the first (and only) query
+                    results.append({
+                        "id": neighbor_match.id, # The ID of the matching datapoint
+                        "distance": neighbor_match.distance, 
+                        "score": 1.0 - neighbor_match.distance if neighbor_match.distance is not None else 0.0 
+                    })
+            
+            logger.info(f"Search (find_neighbors) returned {len(results)} results.")
             return results
-            
+
         except Exception as e:
-            logger.error(f"Error searching index: {e}")
+            logger.error(f"Error searching index with find_neighbors: {e}", exc_info=True)
             raise
 
     def batch_search(self, query_embeddings: List[List[float]], num_neighbors: int = 5) -> List[List[Dict[str, Any]]]:
