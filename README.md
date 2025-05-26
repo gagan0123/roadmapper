@@ -1,4 +1,4 @@
-# Roadmap Generation Agentic System
+# PM Assistant Agentic System
 
 This repository implements a comprehensive roadmap generation system using Google's Agent Development Kit (ADK) and GenKit. The system consists of multiple specialized AI agents that collaborate to analyze documents, align strategies, generate ideas, and synthesize comprehensive roadmaps.
 
