@@ -170,14 +170,14 @@ class VectorSearchIndexManager:
             if self.index:
                 logger.info(f"Updating index with embeddings from GCS directory: {gcs_batch_directory_uri}")
                 update_lro = self.index.update_embeddings(contents_delta_uri=gcs_batch_directory_uri)
-                logger.info(f"Index update LRO initiated: {update_lro.name}. Waiting for completion...")
+                logger.info(f"Index update LRO initiated: {update_lro.operation.name}. Waiting for completion...")
                 
                 # Wait for the LRO to complete
                 start_time_lro_wait = time.time()
-                logger.info(f"Waiting for LRO {update_lro.name} to complete (blocking call to .result())...")
+                logger.info(f"Waiting for LRO {update_lro.operation.name} to complete (blocking call to .result())...")
                 update_lro.result() # This will block until the LRO is done
                 end_time_lro_wait = time.time()
-                logger.info(f"LRO {update_lro.name} .result() call finished. Duration: {end_time_lro_wait - start_time_lro_wait:.2f} seconds.")
+                logger.info(f"LRO {update_lro.operation.name} .result() call finished. Duration: {end_time_lro_wait - start_time_lro_wait:.2f} seconds.")
                 
                 # Check LRO status (though result() would raise an exception on failure)
                 if update_lro.done() and not update_lro.cancelled() and not update_lro.exception():
@@ -193,7 +193,7 @@ class VectorSearchIndexManager:
                             # If the mock (or actual object) isn't a proper exception, wrap it
                             raise RuntimeError(f"LRO failed with non-exception object: {lro_exception}")
                     else:
-                        logger.warning(f"Index update LRO finished but may not have succeeded (cancelled: {update_lro.cancelled()}). Operation: {update_lro.name}")
+                        logger.warning(f"Index update LRO finished but may not have succeeded (cancelled: {update_lro.cancelled()}). Operation: {update_lro.operation.name}")
             
             return gcs_file_uri # Return the specific file URI as it's still useful info
             
@@ -488,9 +488,12 @@ class VectorSearchIndexManager:
 
         # Ensure self.endpoint is a full object, not just from a list() call
         try:
-            logger.debug(f"Refreshing endpoint object for: {self.endpoint.name}")
-            self.endpoint = MatchingEngineIndexEndpoint(self.endpoint.name)
-            logger.debug(f"Endpoint object refreshed. Public match client should exist: {hasattr(self.endpoint, '_public_match_client')}")
+            if not hasattr(self.endpoint, '_is_complete_object') or not self.endpoint._is_complete_object:
+                logger.debug(f"Refreshing endpoint object for: {self.endpoint.name}")
+                self.endpoint = MatchingEngineIndexEndpoint(self.endpoint.name)
+                logger.debug(f"Endpoint object refreshed. Public match client should exist: {hasattr(self.endpoint, '_public_match_client')}")
+            else:
+                logger.debug(f"Endpoint object {self.endpoint.name} is already complete. Skipping refresh.")
         except Exception as e_refresh:
             logger.error(f"Failed to refresh endpoint object {self.endpoint.name}: {e_refresh}")
             # Decide if we should raise here or try to proceed with the existing self.endpoint object
