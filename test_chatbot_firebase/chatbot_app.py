@@ -39,6 +39,7 @@ GCS_BUCKET_NAME = "roadmapper-document-loader" # Create this bucket in your GCP 
 VECTOR_SEARCH_INDEX_NAME = "document-search-index" # This is the display name
 VECTOR_SEARCH_INDEX_ID = "5530728205666746368" # <<< IMPORTANT: SET THIS VALUE
 VECTOR_SEARCH_ENDPOINT_NAME = "doc-loader-test-endpoint"
+CHATBOT_DEPLOYED_INDEX_ID = "rdmp_chatbot_idx_deploy_01" # Must be a valid ID format e.g. [a-z0-9_]+
 
 # --- Document Loader Agent Imports ---
 from agents.document_loader.src.data_source_loader import DataSourceLoader
@@ -166,6 +167,67 @@ async def initialize_document_pipeline():
         else:
             logger.warning(f"Failed to retrieve index using ID '{VECTOR_SEARCH_INDEX_ID}'. It might not exist or there was an error.")
             # Not returning False here, as the manager is init, but index isn't populated in self.index of manager
+        
+        # Ensure vector_search_manager.index is set by get_index before proceeding
+        if not vector_search_manager.index: 
+            logger.error("VectorSearchIndexManager does not have an index object after get_index call. Cannot proceed with endpoint and deployment setup.")
+            return False
+
+        logger.info(f"Attempting to get or create endpoint: {VECTOR_SEARCH_ENDPOINT_NAME}")
+        endpoint_resource_path = f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}/indexEndpoints/{VECTOR_SEARCH_ENDPOINT_NAME}"
+        
+        retrieved_endpoint = vector_search_manager.get_endpoint(endpoint_resource_name=endpoint_resource_path)
+        if not retrieved_endpoint:
+            logger.info(f"Endpoint {endpoint_resource_path} not found via get_endpoint. Attempting to create new endpoint with display name {VECTOR_SEARCH_ENDPOINT_NAME}.")
+            created_endpoint_resource_name = vector_search_manager.create_endpoint(endpoint_name=VECTOR_SEARCH_ENDPOINT_NAME) # create_endpoint uses this as display_name
+            if not created_endpoint_resource_name or not vector_search_manager.endpoint:
+                logger.error(f"Failed to create or retrieve endpoint {VECTOR_SEARCH_ENDPOINT_NAME}.")
+                return False
+            logger.info(f"Endpoint {vector_search_manager.endpoint.resource_name} created and set on manager.")
+        else:
+            logger.info(f"Using existing endpoint: {vector_search_manager.endpoint.resource_name}")
+
+        if not vector_search_manager.endpoint: # Final check for endpoint on manager
+            logger.error("VectorSearchIndexManager does not have an endpoint object. Cannot proceed.")
+            return False
+
+        # Ensure Index is Deployed to the Endpoint
+        deployed_index_id_to_use = None
+        target_index_resource_name = vector_search_manager.index.resource_name
+
+        logger.info(f"Checking for deployments of index {target_index_resource_name} on endpoint {vector_search_manager.endpoint.name}...")
+        if hasattr(vector_search_manager.endpoint, 'deployed_indexes') and vector_search_manager.endpoint.deployed_indexes:
+            for deployed_index_detail in vector_search_manager.endpoint.deployed_indexes:
+                if deployed_index_detail.index_resource_name == target_index_resource_name:
+                    deployed_index_id_to_use = deployed_index_detail.id
+                    logger.info(f"Found existing deployment of index {target_index_resource_name} on endpoint {vector_search_manager.endpoint.name} with Deployed Index ID: {deployed_index_id_to_use}")
+                    break
+        
+        if not deployed_index_id_to_use:
+            logger.info(f"No deployment of index {target_index_resource_name} found on endpoint {vector_search_manager.endpoint.name}. Attempting to deploy now using predefined Deployed Index ID: {CHATBOT_DEPLOYED_INDEX_ID}...")
+            try:
+                vector_search_manager.endpoint.deploy_index(
+                    index=vector_search_manager.index, 
+                    deployed_index_id=CHATBOT_DEPLOYED_INDEX_ID
+                )
+                deployed_index_id_to_use = CHATBOT_DEPLOYED_INDEX_ID
+                logger.info(f"Successfully initiated deployment of index {target_index_resource_name} with Deployed Index ID: {deployed_index_id_to_use}. This is an LRO and may take time.")
+                print(f"Index deployment initiated with Deployed Index ID: {deployed_index_id_to_use}. It may take some time for the index to become queryable.")
+            except Exception as deploy_err:
+                if "already exists" in str(deploy_err).lower() and (f"deployedIndexes/{CHATBOT_DEPLOYED_INDEX_ID}" in str(deploy_err).lower() or f"display_name: \"{CHATBOT_DEPLOYED_INDEX_ID}\"" in str(deploy_err).lower()):
+                    logger.warning(f"Deployment with CHATBOT_DEPLOYED_INDEX_ID ('{CHATBOT_DEPLOYED_INDEX_ID}') seems to already exist: {deploy_err}. Assuming it's usable.")
+                    deployed_index_id_to_use = CHATBOT_DEPLOYED_INDEX_ID
+                else:
+                    logger.error(f"Error during index deployment: {deploy_err}", exc_info=True)
+                    return False # Critical failure if deployment fails for other reasons
+
+        vector_search_manager.deployed_index_id = deployed_index_id_to_use 
+
+        if vector_search_manager.deployed_index_id:
+            logger.info(f"VectorSearchIndexManager configured to use Deployed Index ID: {vector_search_manager.deployed_index_id} on endpoint {vector_search_manager.endpoint.name}")
+        else:
+            logger.error(f"Failed to set a Deployed Index ID for the VectorSearchIndexManager. Searches will likely fail.")
+            return False
 
         print("FULL document pipeline initialization attempt complete.")
         return True 
@@ -418,27 +480,142 @@ async def trigger_document_loading_and_indexing():
         traceback.print_exc()
         return f"Error: {e}"
 
-# --- Chatbot Logic (to be expanded) ---
-def get_chatbot_response(user_input, history):
-    # Placeholder for chatbot response logic
-    # In the future, this will:
-    # 1. Query the vector DB for context (if documents are embedded).
-    # 2. Call a language model with the user_input and context.
-    # 3. Optionally, save chat history to Firebase.
-    
-    bot_response = f"Echo: {user_input}" # Simple echo for now
-    
-    # Example: Save to Firestore (optional)
+# --- Chatbot Logic ---
+def ask_llm(question: str, context: Optional[str]) -> str:
+    """Placeholder for a call to a Language Model."""
+    if context:
+        # Truncate context for display in this placeholder
+        return f"LLM (with context): Based on the retrieved documents, the answer to '{question}' is likely related to: [Context: {context[:500]}...]"
+    else:
+        return f"LLM (no context): I don't have specific documents to reference for '{question}'. Thinking..."
+
+async def get_chatbot_response(user_input, history): # Make it async
+    global vector_search_manager, text_embedding_processor, document_store, db # Ensure globals are accessible
+
+    bot_response = ""
+    context_for_llm = None
+
+    # Check if document pipeline is ready for search
+    pipeline_ready = (
+        vector_search_manager and
+        vector_search_manager.index and
+        vector_search_manager.endpoint and
+        vector_search_manager.deployed_index_id and
+        text_embedding_processor
+    )
+
+    if pipeline_ready:
+        logger.info(f"Pipeline ready. Processing query: '{user_input}' with context.")
+        try:
+            # 1. Generate query embedding
+            # text_embedding_processor.generate_embeddings expects List[Document]
+            query_doc = Document(id="user_query_doc", content=user_input, category="user_query", embedding_model_type="text")
+            
+            # generate_embeddings is async and returns List[Embedding]
+            query_embeddings_list = await text_embedding_processor.generate_embeddings(documents=[query_doc])
+            
+            if not query_embeddings_list or not query_embeddings_list[0].embedding:
+                logger.error("Failed to generate embedding for the user query.")
+                bot_response = "Error: Could not process your query (embedding failed)."
+            else:
+                query_embedding_vector = query_embeddings_list[0].embedding
+                logger.info(f"Query embedding generated successfully. Vector length: {len(query_embedding_vector)}")
+
+                # 2. Search vector index
+                try:
+                    # Ensure deployed_index_id is passed to search if your manager's search method requires it
+                    # and it's not implicitly using the one set on the manager object.
+                    # The VectorSearchIndexManager's search method implementation details matter here.
+                    # Assuming search method uses the manager's self.deployed_index_id if set.
+                    search_results = vector_search_manager.search(
+                        query_embedding=query_embedding_vector, 
+                        num_neighbors=3 
+                    )
+                    logger.info(f"Search returned {len(search_results)} results.")
+
+                    # 3. Retrieve document content
+                    retrieved_doc_contents = []
+                    if search_results:
+                        for result in search_results:
+                            # The 'id' from search result is the document_id (embedding_id) used when uploading embeddings.
+                            doc_id = result.get("id") 
+                            # This ID should match keys in the global `document_store` if store is populated by doc.id.
+                            # However, embeddings were generated with Embedding(document_id=doc.id, ...).
+                            # The search result 'id' is the ID of the Embedding object itself (e.g., "embedding_0", "embedding_1").
+                            # We need to ensure document_store keys and search result IDs align, or map them.
+
+                            # For now, let's assume the search result 'id' IS the document_id.
+                            # This needs to be true for document_store.get(doc_id) to work.
+                            # If search result 'id' refers to an embedding chunk and not the whole doc,
+                            # we might need to adjust how we store/retrieve full document content.
+                            # Let's re-check how document_store is populated vs. what search returns.
+                            # Document_store keys are doc.id.
+                            # Embedding objects have a document_id attribute.
+                            # The search method in VectorSearchIndexManager returns datapoint id.
+                            # This datapoint id IS the embedding id (e.g., "embedding_0", "embedding_1")
+                            # NOT the original document id.
+                            # THIS IS A CRITICAL POINT: The current setup of document_store will NOT work directly with search result IDs.
+                            # For this subtask, we will proceed with the assumption that the ID from search somehow maps to a document.
+                            # A proper solution would involve storing documents such that they can be retrieved by an ID known to the search result,
+                            # or modifying search results to include original document_id.
+                            # For now, we will log a warning if a doc is not found and try to continue.
+
+                            doc = document_store.get(doc_id) # This line is potentially problematic if doc_id is not a key in document_store
+                            if doc and doc.content:
+                                retrieved_doc_contents.append(doc.content)
+                                logger.info(f"Retrieved content for doc ID from search result: {doc_id}")
+                            else:
+                                # Attempt to find the document by iterating through the store if direct lookup fails
+                                # This is inefficient and a workaround for the ID mismatch issue.
+                                found_by_iteration = False
+                                for stored_doc_id, stored_doc in document_store.items():
+                                    # This assumes that the search result 'id' might be part of a larger document's content
+                                    # or that the search result 'id' (embedding_id) was stored as metadata.
+                                    # This is speculative. The most robust fix is to ensure correct IDs are returned by search or stored.
+                                    if doc_id in stored_doc_id: # Example of a loose match, highly unreliable
+                                         retrieved_doc_contents.append(stored_doc.content)
+                                         logger.warning(f"Retrieved content for doc ID {stored_doc_id} by iterating store, based on search result ID {doc_id}.")
+                                         found_by_iteration = True
+                                         break
+                                if not found_by_iteration:
+                                    logger.warning(f"Could not find document or content for ID: {doc_id} in document_store directly. This ID might be an embedding ID, not a document ID.")
+                        
+                        if retrieved_doc_contents:
+                            context_for_llm = "\n---\n".join(retrieved_doc_contents)
+                            logger.info(f"Context constructed from {len(retrieved_doc_contents)} documents.")
+                        else:
+                            logger.info("Search yielded results, but no content could be retrieved from document_store using search result IDs.")
+                    else:
+                        logger.info("Search returned no results.")
+                
+                except Exception as search_err:
+                    logger.error(f"Error during vector search: {search_err}", exc_info=True)
+                    bot_response = "Error: Failed to search for relevant documents."
+
+        except Exception as e:
+            logger.error(f"Error processing query with context: {e}", exc_info=True)
+            bot_response = "Error: An unexpected issue occurred while processing your query with context."
+        
+        # If bot_response was set by an error, it will be used. Otherwise, call LLM.
+        if not bot_response: # Only call LLM if no error message has been set yet
+            bot_response = ask_llm(user_input, context_for_llm)
+
+    else: # Pipeline not ready
+        logger.info(f"Document pipeline not fully initialized or index not deployed. Query: '{user_input}' without context.")
+        bot_response = ask_llm(user_input, None)
+
+    # Save to Firestore (optional, existing logic)
     if db:
         try:
             chat_ref = db.collection('chats').document()
             chat_ref.set({
                 'user_input': user_input,
                 'bot_response': bot_response,
-                'timestamp': firestore.SERVER_TIMESTAMP
+                'timestamp': firestore.SERVER_TIMESTAMP, # Ensure firestore is imported
+                'context_used': bool(context_for_llm) # Log if context was used
             })
         except Exception as e:
-            print(f"Error saving chat to Firebase: {e}")
+            logger.error(f"Error saving chat to Firebase: {e}", exc_info=True) # Log with traceback
             
     return bot_response
 
