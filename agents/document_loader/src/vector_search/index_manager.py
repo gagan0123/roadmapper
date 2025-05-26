@@ -2,16 +2,17 @@ from typing import List, Optional, Dict, Any, Tuple
 from google.cloud import aiplatform
 from google.cloud import storage
 from google.cloud.aiplatform import MatchingEngineIndex, MatchingEngineIndexEndpoint
-from google.cloud.aiplatform_v1 import PredictionServiceClient
-from google.cloud.aiplatform_v1.types import PredictRequest
-from google.protobuf import json_format
-from google.protobuf.struct_pb2 import Value
+from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import MatchNeighbor, Namespace
 import json
 import os
 import logging
 import time
 from ..models.base import Embedding, VectorSearchConfig
 from datetime import datetime
+from google.cloud.aiplatform_v1 import PredictionServiceClient
+from google.cloud.aiplatform_v1.types import PredictRequest
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
 
 logger = logging.getLogger(__name__)
 
@@ -485,46 +486,72 @@ class VectorSearchIndexManager:
             logger.error("Cannot search: Index not deployed or endpoint not set.")
             raise Exception("Index not deployed. Ensure deployment first.")
 
+        # Ensure self.endpoint is a full object, not just from a list() call
         try:
-            logger.debug(f"Performing search on deployed_index_id: {self.deployed_index_id} with {num_neighbors} neighbors using endpoint.find_neighbors.")
-            
+            logger.debug(f"Refreshing endpoint object for: {self.endpoint.name}")
+            self.endpoint = MatchingEngineIndexEndpoint(self.endpoint.name)
+            logger.debug(f"Endpoint object refreshed. Public match client should exist: {hasattr(self.endpoint, '_public_match_client')}")
+        except Exception as e_refresh:
+            logger.error(f"Failed to refresh endpoint object {self.endpoint.name}: {e_refresh}")
+            # Decide if we should raise here or try to proceed with the existing self.endpoint object
+            raise # Re-raise for now, as a stale object is likely the cause of the error
+
+        # Convert filter_criteria to List[Namespace] if provided
+        sdk_filters: Optional[List[Namespace]] = None
+        if filter_criteria:
             sdk_filters = []
-            if filter_criteria: 
-                # Expecting filter_criteria = [{"namespace": "ns1", "allow_list": ["token1"]}, ...]
-                for fc_item in filter_criteria:
-                    namespace_name = fc_item.get("namespace")
-                    allow_tokens_list = fc_item.get("allow_list") # Changed from allow to allow_list
-                    if namespace_name and allow_tokens_list is not None: # Ensure allow_list can be empty if intended
-                        sdk_filters.append(
-                            aiplatform.matching_engine.matching_engine_index_endpoint.Namespace(
-                                name=namespace_name,
-                                allow_tokens=allow_tokens_list
-                            )
-                        )
-                    else:
-                        logger.warning(f"Skipping filter item due to missing namespace or allow_list: {fc_item}")
-                logger.debug(f"Constructed SDK filters for find_neighbors: {sdk_filters}")
-            
-            # find_neighbors returns a list of lists of ReadIndexDatapointsResponse.Neighbor
-            # Each inner list corresponds to a query. Since we send one query, we get results[0].
-            find_neighbors_response = self.endpoint.find_neighbors(
+            for fc_item in filter_criteria:
+                # fc_item is e.g. {"namespace": "category", "allow_list": ["X"]}
+                # Note: current Document structure uses "allow_list". Namespace uses "allow_tokens".
+                ns_name = fc_item.get("namespace")
+                allow_tokens_list = fc_item.get("allow_list") 
+                deny_tokens_list = fc_item.get("deny_list")
+
+                if ns_name and (allow_tokens_list or deny_tokens_list) :
+                    sdk_filters.append(Namespace(
+                        name=ns_name, 
+                        allow_tokens=allow_tokens_list or [],
+                        deny_tokens=deny_tokens_list or []
+                    ))
+            if not sdk_filters:
+                logger.warning(f"filter_criteria provided but resulted in empty sdk_filters: {filter_criteria}")
+
+
+        try:
+            logger.debug(
+                f"Performing find_neighbors on endpoint: {self.endpoint.resource_name}, "
+                f"deployed_index_id: {self.deployed_index_id}, num_neighbors: {num_neighbors}"
+            )
+            if sdk_filters:
+                logger.debug(f"  with filters: {[f.name for f in sdk_filters]}")
+
+            # find_neighbors expects a list of queries. We are sending one.
+            response: List[List[MatchNeighbor]] = self.endpoint.find_neighbors(
+                queries=[query_embedding],
                 deployed_index_id=self.deployed_index_id,
-                queries=[query_embedding], # find_neighbors expects a list of query vectors
                 num_neighbors=num_neighbors,
-                filter=sdk_filters if sdk_filters else [] # Pass empty list if no filters
+                filter=sdk_filters, # Pass the converted filters
+                return_full_datapoint=False # Optional, False by default
             )
 
             results = []
-            # find_neighbors_response is List[List[Neighbor]]
-            if find_neighbors_response and find_neighbors_response[0]: 
-                for neighbor_match in find_neighbors_response[0]: # Get neighbors for the first (and only) query
+            # Response is List[List[MatchNeighbor]]. Outer list for queries, inner for neighbors.
+            if response and response[0]:
+                for neighbor in response[0]:
+                    score = None
+                    if neighbor.distance is not None:
+                        # Assuming smaller distance is better, convert to a similarity score.
+                        # For cosine distance (0 to 2), 1 - (distance/2) could map to [0,1] score.
+                        # Or simply 1 - distance if distance is already in a good range for this.
+                        # Let's use a simple 1.0 - distance for now, and adjust if needed based on typical distance values.
+                        score = 1.0 - neighbor.distance
                     results.append({
-                        "id": neighbor_match.id, # The ID of the matching datapoint
-                        "distance": neighbor_match.distance, 
-                        "score": 1.0 - neighbor_match.distance if neighbor_match.distance is not None else 0.0 
+                        "id": neighbor.id, 
+                        "distance": neighbor.distance,
+                        "score": score 
                     })
             
-            logger.info(f"Search (find_neighbors) returned {len(results)} results.")
+            logger.info(f"Search (find_neighbors) returned {len(results)} results for the query.")
             return results
 
         except Exception as e:
@@ -533,68 +560,60 @@ class VectorSearchIndexManager:
 
     def batch_search(self, query_embeddings: List[List[float]], num_neighbors: int = 5) -> List[List[Dict[str, Any]]]:
         """Perform batch search with multiple query embeddings."""
+        # TODO: Refactor this to use self.endpoint.find_neighbors if single search works.
+        # For now, it still uses the old PredictionServiceClient method.
         try:
             if not self.endpoint or not self.deployed_index_id:
                 raise Exception("Index not deployed. Call deploy_index() first.")
             
+            if not self.prediction_client: # Prediction client is still used by batch_search
+                 logger.error("Prediction client not initialized. Cannot perform batch_search.")
+                 raise Exception("Prediction client not initialized.")
+
             # Prepare batch queries
             queries = []
             for embedding in query_embeddings:
                 queries.append({
-                    "embedding": embedding,
-                    "neighbor_count": num_neighbors
+                    "embedding": embedding,       # Changed to "embedding"
+                    "neighborCount": num_neighbors # Changed to "neighborCount"
                 })
             
-            query_instance = {
-                "deployed_index_id": self.deployed_index_id,
-                "queries": queries
+            instances_list = queries # The list of query instances
+            instance_values = [json_format.ParseDict(inst, Value()) for inst in instances_list]
+            
+            predict_parameters = {
+                "deployedIndexId": self.deployed_index_id # Camel case
             }
+            parameters_value = json_format.ParseDict(predict_parameters, Value())
             
             # Call predict directly with endpoint and instances
-            response = self.prediction_client.predict(
+            predict_response = self.prediction_client.predict(
                 endpoint=self.endpoint.resource_name,
-                instances=[query_instance]
+                instances=instance_values,
+                parameters=parameters_value
             )
             
             # Parse results for each query
             batch_results = []
-            if response.predictions:
-                for prediction in response.predictions:
-                    if isinstance(prediction, Value):
-                        prediction_dict = json_format.MessageToDict(prediction)
-                    else:
-                        prediction_dict = prediction
-                    
-                    # Each prediction should contain results for all queries
-                    if "neighbors" in prediction_dict:
-                        # Single query result format
-                        query_results = []
-                        neighbors = prediction_dict.get("neighbors", [])
-                        for neighbor in neighbors:
-                            query_results.append({
-                                "id": neighbor.get("id"),
-                                "distance": neighbor.get("distance"),
-                                "score": 1 - neighbor.get("distance", 1)
-                            })
-                        batch_results.append(query_results)
-                    elif "results" in prediction_dict:
-                        # Batch query result format
-                        for result in prediction_dict["results"]:
-                            query_results = []
-                            neighbors = result.get("neighbors", [])
-                            for neighbor in neighbors:
-                                query_results.append({
-                                    "id": neighbor.get("id"),
-                                    "distance": neighbor.get("distance"),
-                                    "score": 1 - neighbor.get("distance", 1)
-                                })
-                            batch_results.append(query_results)
+            if predict_response.predictions:
+                for prediction_value in predict_response.predictions: # This is a list of Value
+                    prediction_dict = json_format.MessageToDict(prediction_value)
+                    # Each prediction_dict should contain results for one query from the batch.
+                    # The structure within prediction_dict is expected to be {"neighbors": [...]}
+                    query_results = []
+                    neighbors_data = prediction_dict.get("neighbors", [])
+                    for neighbor_item in neighbors_data:
+                        query_results.append({
+                            "id": neighbor_item.get("id") or neighbor_item.get("datapoint", {}).get("datapointId"),
+                            "distance": neighbor_item.get("distance")
+                        })
+                    batch_results.append(query_results)
             
             logger.info(f"Batch search processed {len(query_embeddings)} queries")
             return batch_results
             
         except Exception as e:
-            logger.error(f"Error in batch search: {e}")
+            logger.error(f"Error in batch search (still uses PredictionServiceClient): {e}", exc_info=True)
             raise
 
     def undeploy_index(self) -> bool:

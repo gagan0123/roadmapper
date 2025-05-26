@@ -498,12 +498,17 @@ async def perform_test_search():
 
         print("Test search completed.")
         if search_results:
-            print("Search Results:")
+            print(f"Found {len(search_results)} neighbors:")
             for i, result in enumerate(search_results):
-                print(f"  {i+1}. ID: {result.get('id')}, Score: {result.get('score'):.4f} (Distance: {result.get('distance'):.4f})")
-                # Optionally, retrieve and show document content if we have a way to map ID back to content
-                # if result.get('id') in document_store:
-                #     print(f"     Content snippet: {document_store[result.get('id')].content[:100]}...")
+                id_val = result.get('id')
+                score_val = result.get('score')
+                dist_val = result.get('distance')
+                
+                score_str = f"{score_val:.4f}" if score_val is not None else "N/A"
+                dist_str = f"{dist_val:.4f}" if dist_val is not None else "N/A"
+                
+                print(f"  {i+1}. ID: {id_val}, Score: {score_str} (Distance: {dist_str})")
+                # Also print the document content if we decide to fetch it later
             return f"Test search successful. Found {len(search_results)} results (see console)."
         else:
             print("No results found for the test query.")
