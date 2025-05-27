@@ -197,6 +197,123 @@ async def initialize_document_pipeline():
         traceback.print_exc()
         return False
 
+async def populate_document_store_on_startup():
+    """Loads documents from all configured sources into the in-memory document_store on startup."""
+    global document_store, data_source_loader # Make sure to use globals if these are defined globally
+
+    status_message = "Attempting to populate document_store on startup from sources..."
+    logger.info(status_message)
+
+    if not data_source_loader:
+        error_msg = "ERROR: DataSourceLoader not initialized during startup. Cannot populate document_store."
+        logger.error(error_msg)
+        return error_msg
+
+    all_loaded_documents: List[Document] = []
+    try:
+        # 1. Load user credentials for Drive (if available)
+        user_drive_creds = load_user_drive_credentials()
+        if user_drive_creds:
+            logger.info("User Drive credentials loaded successfully for startup load.")
+        else:
+            logger.info("No user Drive credentials found for startup load. Drive processing will use service account or fail.")
+
+        # 2. Load documents from different sources
+        logger.info("Loading documents from configured sources for startup...")
+
+        # A. Process Google Drive sources
+        drive_folders_config = data_source_loader.load_drive_folders()
+        if drive_folders_config:
+            logger.info(f"Found {len(drive_folders_config)} Drive item(s) to process for startup document_store population.")
+            for item_id, category, model_type in drive_folders_config:
+                logger.info(f"  Startup processing Drive item: {item_id} (Category: {category}, Model Type: {model_type})")
+                try:
+                    drive_loader = DriveLoader(
+                        item_id=item_id,
+                        category=category,
+                        embedding_model_type=model_type,
+                        user_credentials=user_drive_creds
+                    )
+                    if not await drive_loader.validate_connection():
+                        logger.warning(f"  Failed to validate connection for Drive item {item_id} during startup. Skipping.")
+                        continue
+                    async for doc in drive_loader.load():
+                        if doc:
+                            all_loaded_documents.append(doc)
+                    logger.info(f"  Finished startup loading from Drive item {item_id}.")
+                except Exception as e:
+                    logger.error(f"Error during startup processing of Drive item {item_id}: {e}", exc_info=True)
+        else:
+            logger.info("No Google Drive sources configured for startup load.")
+
+        # B. Process GitHub repositories
+        github_repos_config = data_source_loader.load_github_repos()
+        if github_repos_config:
+            logger.info(f"Found {len(github_repos_config)} GitHub repo configurations to process for startup.")
+            github_token = os.getenv('GITHUB_TOKEN')
+            if not github_token:
+                logger.warning("GITHUB_TOKEN not set for startup. GitHubLoader might have limited access.")
+            for repo_config_name, category, model_type in github_repos_config:
+                logger.info(f"  Startup processing GitHub repo: {repo_config_name}")
+                try:
+                    github_loader = GitHubLoader(
+                        repo_name=repo_config_name, token=github_token, category=category, embedding_model_type=model_type)
+                    if not await github_loader.validate_connection():
+                        logger.warning(f"Failed to validate GitHub connection for {repo_config_name} during startup. Skipping.")
+                        continue
+                    async for doc in github_loader.load():
+                        if doc:
+                            all_loaded_documents.append(doc)
+                except Exception as e:
+                    logger.error(f"Error processing GitHub repo {repo_config_name} during startup: {e}", exc_info=True)
+        else:
+            logger.info("No GitHub sources configured for startup load.")
+
+        # C. Process Web URLs
+        web_urls_config = data_source_loader.load_web_urls()
+        if web_urls_config:
+            logger.info(f"Found {len(web_urls_config)} Web URL configurations to process for startup.")
+            for single_url, category, model_type in web_urls_config:
+                logger.info(f"  Startup processing Web URL: {single_url}")
+                try:
+                    web_loader = WebLoader(
+                        urls=[single_url], category=category, embedding_model_type=model_type)
+                    if not await web_loader.validate_connection():
+                        logger.warning(f"Failed to validate WebLoader connection for {single_url} during startup. Skipping.")
+                        continue
+                    async for doc in web_loader.load():
+                        if doc:
+                            all_loaded_documents.append(doc)
+                except Exception as e:
+                    logger.error(f"Error processing Web URL {single_url} during startup: {e}", exc_info=True)
+        else:
+            logger.info("No Web URL sources configured for startup load.")
+
+        if not all_loaded_documents:
+            message = "No documents were loaded from any source during startup. document_store will be empty."
+            logger.warning(message)
+            document_store.clear() # Ensure it's empty if nothing loaded
+            return message
+        
+        logger.info(f"Successfully loaded {len(all_loaded_documents)} document(s) from all sources during startup.")
+        
+        document_store.clear()
+        for doc_idx, doc_obj in enumerate(all_loaded_documents): # Changed variable names for clarity
+            if doc_obj and doc_obj.id:
+                 document_store[doc_obj.id] = doc_obj
+            else:
+                logger.warning(f"Encountered a document with no ID during startup storing (index {doc_idx}): {doc_obj.metadata if doc_obj else 'None'}")
+
+        final_status = f"document_store populated with {len(document_store)} documents on startup."
+        logger.info(final_status)
+        return final_status
+
+    except Exception as e:
+        error_msg = f"Error during startup population of document_store: {e}"
+        logger.error(error_msg, exc_info=True)
+        traceback.print_exc()
+        return f"ERROR: {error_msg}"
+
 async def trigger_document_loading_and_indexing():
     global document_store, data_source_loader, text_embedding_processor, multimodal_embedding_processor, vector_search_manager
     
@@ -698,9 +815,19 @@ Answer:
 #     return "ASYNC GLOBAL simple_test_button_click successful (check console)!"
 
 async def run_app():
-    success = await initialize_document_pipeline() # Calls STUBBED version
-    if not success:
-        logger.warning("Document pipeline failed to initialize.") # Simplified message
+    success_init_pipeline = await initialize_document_pipeline() # Calls STUBBED version
+    if not success_init_pipeline:
+        logger.warning("Document pipeline failed to initialize. Chatbot may not have full functionality.") # Simplified message
+    else:
+        # Attempt to populate document_store on startup
+        logger.info("Attempting to populate document_store on application startup...")
+        startup_load_status = await populate_document_store_on_startup()
+        logger.info(f"Startup document_store population status: {startup_load_status}")
+        if "ERROR" in startup_load_status or "No documents" in startup_load_status : # Check for error or no docs
+             logger.warning("Problem during startup document_store population. It might be empty or incomplete. RAG may not work until documents are manually loaded and indexed.")
+        else:
+             logger.info("document_store populated from sources on startup.")
+
 
     with gr.Blocks(title="Roadmapper Test Chatbot") as demo:
         gr.Markdown("## Roadmapper Test Chatbot")
